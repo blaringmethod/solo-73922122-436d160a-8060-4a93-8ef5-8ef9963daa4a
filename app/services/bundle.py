@@ -10,9 +10,17 @@ Guarantees implemented here:
   (PUT + If-Match); a stale/missing version rejects the whole bundle.
 * Out-of-order urn:uuid forward references are resolved after parsing.
 * Every report and its observations must belong to the same patient; moving an
-* observation to another patient is rejected unless every referencing report is
-* corrected in the same bundle.
-* All writes commit in one transaction: any failure leaves nothing behind.
+  observation to another patient is rejected unless every referencing report is
+  corrected in the same bundle.
+* Each DiagnosticReport version records, in the same transaction, a
+  version-pinned binding for every result Observation. New reports and newly
+  added references bind the observation version committed by that bundle;
+  corrections keep the previous pin unless the observation is corrected in the
+  same bundle, in which case they rebind. Pre-binding legacy versions and
+  genuinely untraceable references are stored as explicit untraceable rows and
+  stay untraceable until a shared-bundle observation correction.
+* All writes (resource versions plus result bindings) commit in one
+  transaction: any failure leaves nothing behind.
 """
 from __future__ import annotations
 
@@ -43,6 +51,7 @@ from app.models import (
     Patient,
     PatientIdentifier,
     ReportLink,
+    ReportResultBinding,
     ResourceVersion,
 )
 
@@ -72,6 +81,13 @@ class ParsedEntry:
     action: str | None = None       # created | updated | existing
     subject_pid: str | None = None  # resolved patient id
     result_obs_ids: list[str] = field(default_factory=list)
+    # Observation id -> version that will be current once this bundle commits.
+    # Populated after _apply_observations so report bindings pin the right
+    # version for both in-bundle creates/updates and pre-existing observations.
+    obs_new_versions: dict[str, int] = field(default_factory=dict)
+    # Observation ids that are themselves entries corrected/created in this
+    # same bundle (vs. pre-existing observations referenced by absolute id).
+    in_bundle_obs_ids: set[str] = field(default_factory=set)
 
 
 def _is_sqlite(session: Session) -> bool:
@@ -385,6 +401,7 @@ def process_bundle(session: Session, bundle: dict, idempotency_key: str) -> dict
         _validate_patient_alignment(entries, obs_rows, report_rows, session)
 
         _apply_observations(session, observation_entries, obs_rows, patient_rows, entries)
+        _populate_observation_versions(session, report_entries, entries)
         _apply_reports(session, report_entries, report_rows, obs_rows, entries)
 
         receipt = _build_receipt(entries, idempotency_key)
@@ -787,6 +804,44 @@ def _apply_observations(
             entry.version = new_version
 
 
+def _populate_observation_versions(
+    session: Session,
+    report_entries: list[ParsedEntry],
+    all_entries: list[ParsedEntry],
+) -> None:
+    """Resolve, for every report entry, the Observation version that will be
+    current once this bundle commits.
+
+    * Observations corrected/created in this bundle -> the newly committed
+      version (taken from the observation entry's post-apply version).
+    * Pre-existing observations referenced by absolute id -> their current
+      version row, locked so a concurrent correction serializes with us.
+    """
+    in_bundle_versions: dict[str, int] = {}
+    for entry in all_entries:
+        if entry.resource_type == "Observation":
+            in_bundle_versions[entry.row_id] = entry.version  # type: ignore[assignment]
+
+    for report in report_entries:
+        versions: dict[str, int] = {}
+        in_bundle: set[str] = set()
+        for oid in report.result_obs_ids:
+            if oid in in_bundle_versions:
+                versions[oid] = in_bundle_versions[oid]
+                in_bundle.add(oid)
+            else:
+                obs = _locked(session, Observation, oid)
+                # _resolve_reports already validated existence; this is defensive.
+                if obs is None:  # pragma: no cover
+                    raise unprocessable(
+                        f"Bundle.entry[{report.index}]: result references unknown "
+                        f"Observation/{oid}."
+                    )
+                versions[oid] = obs.version
+        report.obs_new_versions = versions
+        report.in_bundle_obs_ids = in_bundle
+
+
 def _apply_reports(
     session: Session,
     report_entries: list[ParsedEntry],
@@ -803,6 +858,7 @@ def _apply_reports(
             {"reference": f"Observation/{oid}"} for oid in entry.result_obs_ids
         ]
 
+        prior_bindings: dict[str, ReportResultBinding] = {}
         if entry.method == "PUT":
             report.patient_id = entry.subject_pid  # type: ignore[assignment]
             report.version = target_version
@@ -811,12 +867,21 @@ def _apply_reports(
             for link in list(report.links):
                 session.delete(link)
             session.flush()
+            prior_bindings = _prior_version_bindings(session, report.id, target_version - 1)
         else:
             report.version = 1
 
         report.resource = resource
         for oid in entry.result_obs_ids:
             session.add(ReportLink(report_id=report.id, observation_id=oid))
+
+        _write_result_bindings(
+            session=session,
+            entry=entry,
+            report=report,
+            target_version=target_version,
+            prior_bindings=prior_bindings,
+        )
 
         session.add(
             ResourceVersion(
@@ -828,6 +893,100 @@ def _apply_reports(
             )
         )
         entry.version = target_version
+
+
+def _prior_version_bindings(
+    session: Session, report_id: str, prior_version: int
+) -> dict[str, ReportResultBinding]:
+    """Bindings recorded for the previous report version, keyed by observation id.
+
+    A legacy report version (written before version bindings existed) has no
+    rows at all; callers treat that absence as "untraceable" and materialize
+    explicit untraceable rows so the state is carried forward deterministically.
+    """
+    rows = session.execute(
+        select(ReportResultBinding).where(
+            ReportResultBinding.report_id == report_id,
+            ReportResultBinding.report_version == prior_version,
+        )
+    ).scalars().all()
+    return {row.observation_id: row for row in rows}
+
+
+def _write_result_bindings(
+    session: Session,
+    entry: ParsedEntry,
+    report: DiagnosticReport,
+    target_version: int,
+    prior_bindings: dict[str, ReportResultBinding],
+) -> None:
+    """Pin every result reference of this report version to an Observation version.
+
+    Rules (see service module docstring):
+
+    * New report, or a newly added result reference: bind to the observation
+      version in force after this bundle commits.
+    * Corrected report keeping a reference that the prior version already bound:
+      keep the prior pinned version.
+    * Kept reference whose observation is also corrected in this bundle: rebind
+      to the new observation version.
+    * Kept reference that the prior version could not trace (or a legacy prior
+      version with no bindings): emit an explicit untraceable row and carry
+      that state forward until the observation is corrected in a shared bundle.
+    """
+    is_create = entry.method == "POST"
+    legacy_prior = (not is_create) and not prior_bindings
+
+    for position, oid in enumerate(entry.result_obs_ids):
+        new_version = entry.obs_new_versions[oid]
+        prior = prior_bindings.get(oid)
+        corrected_here = _is_in_bundle_obs(entry, oid)
+
+        if is_create:
+            # New report: every reference binds the version committed by this
+            # bundle (in-bundle create/update, or the current external version).
+            traceable, pinned = True, new_version
+        elif legacy_prior:
+            # Prior report version predates version bindings: nothing was ever
+            # recorded to trace to, unless this bundle also corrects the
+            # observation, in which case the new version becomes traceable.
+            if corrected_here:
+                traceable, pinned = True, new_version
+            else:
+                traceable, pinned = False, None
+        elif prior is None:
+            # Newly added result reference on an existing report.
+            traceable, pinned = True, new_version
+        elif not prior.traceable:
+            # Previously untraceable: stay untraceable, unless the observation
+            # is corrected in this same bundle (rebind to the new version).
+            if corrected_here:
+                traceable, pinned = True, new_version
+            else:
+                traceable, pinned = False, None
+        else:
+            # Prior pin exists: keep it; only an in-bundle observation
+            # correction rebinds this report reference to the new version.
+            if corrected_here:
+                traceable, pinned = True, new_version
+            else:
+                traceable, pinned = True, prior.observation_version
+
+        session.add(
+            ReportResultBinding(
+                report_id=report.id,
+                report_version=target_version,
+                observation_id=oid,
+                observation_version=pinned,
+                traceable=traceable,
+                position=position,
+            )
+        )
+
+
+def _is_in_bundle_obs(entry: ParsedEntry, observation_id: str) -> bool:
+    """Whether the referenced observation is also an entry in this bundle."""
+    return observation_id in entry.in_bundle_obs_ids
 
 
 # --------------------------------------------------------------------------- #

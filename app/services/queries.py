@@ -12,6 +12,7 @@ from app.models import (
     Patient,
     PatientIdentifier,
     ReportLink,
+    ReportResultBinding,
     ResourceVersion,
 )
 
@@ -139,3 +140,112 @@ def report_observation_ids(session: Session, report_id: str) -> list[str]:
         .scalars()
         .all()
     )
+
+
+# --------------------------------------------------------------------------- #
+# Versioned report snapshot: the report body plus the exact Observation
+# version (and body) that each result reference was bound to at that version.
+# --------------------------------------------------------------------------- #
+
+def _resource_version(
+    session: Session, resource_type: str, resource_id: str, version: int
+) -> ResourceVersion | None:
+    return session.execute(
+        select(ResourceVersion).where(
+            ResourceVersion.resource_type == resource_type,
+            ResourceVersion.resource_id == resource_id,
+            ResourceVersion.version == version,
+        )
+    ).scalar_one_or_none()
+
+
+def report_version_snapshot(
+    session: Session, report_id: str, version: int
+) -> dict:
+    """Return one DiagnosticReport version with its pinned observation values.
+
+    The report body comes from the append-only ``resource_versions`` history.
+    Each result entry resolves the binding recorded for that report version:
+
+    * traceable binding -> the bound Observation id/version and the exact body
+      stored at that observation version;
+    * untraceable / legacy version with no bindings -> an explicit
+      ``traceable: false`` entry with a reason and no observation body.
+    """
+    report_version_row = _resource_version(
+        session, "DiagnosticReport", report_id, version
+    )
+    if report_version_row is None:
+        # Distinguish an unknown report from a missing version for a clearer 404.
+        if session.get(DiagnosticReport, report_id) is None:
+            raise not_found(f"DiagnosticReport/{report_id} does not exist.")
+        raise not_found(
+            f"DiagnosticReport/{report_id} has no version {version}."
+        )
+
+    bindings = session.execute(
+        select(ReportResultBinding)
+        .where(
+            ReportResultBinding.report_id == report_id,
+            ReportResultBinding.report_version == version,
+        )
+        .order_by(ReportResultBinding.position)
+    ).scalars().all()
+
+    results: list[dict] = []
+    if bindings:
+        for binding in bindings:
+            item: dict = {
+                "position": binding.position,
+                "observationId": binding.observation_id,
+                "traceable": binding.traceable,
+            }
+            if binding.traceable and binding.observation_version is not None:
+                item["observationVersion"] = binding.observation_version
+                item["etag"] = etag(binding.observation_version)
+                obs_version_row = _resource_version(
+                    session,
+                    "Observation",
+                    binding.observation_id,
+                    binding.observation_version,
+                )
+                if obs_version_row is None:
+                    # Defensive: bindings are written in the same transaction as
+                    # the observation version, so this should never happen.
+                    item["traceable"] = False
+                    item.pop("observationVersion", None)
+                    item.pop("etag", None)
+                    item["reason"] = "bound-observation-version-missing"
+                else:
+                    item["resource"] = obs_version_row.resource
+            else:
+                item["reason"] = "no-version-binding"
+            results.append(item)
+    else:
+        # Legacy report version (committed before version bindings existed):
+        # surface each reference from the stored report body as untraceable.
+        body = report_version_row.resource or {}
+        for position, ref_obj in enumerate(body.get("result") or []):
+            ref = (ref_obj or {}).get("reference", "")
+            obs_id = ref.split("/", 1)[1] if "/" in ref else ref
+            results.append(
+                {
+                    "position": position,
+                    "observationId": obs_id,
+                    "traceable": False,
+                    "reason": "legacy-version-without-bindings",
+                }
+            )
+
+    return {
+        "resourceType": "DiagnosticReport",
+        "id": report_id,
+        "version": version,
+        "etag": etag(version),
+        "status": report_version_row.status,
+        "createdAt": report_version_row.created_at.isoformat()
+        if report_version_row.created_at
+        else None,
+        "resource": report_version_row.resource,
+        "result": results,
+    }

@@ -117,9 +117,46 @@ Content-Type: application/json
 | GET | `/patients/{id}/diagnostic-reports` | 该患者全部报告（含观测 id 列表） |
 | GET | `/observations/{id}` | 单个观测（响应头带 `ETag: W/"v"`） |
 | GET | `/diagnostic-reports/{id}` | 单个报告 |
+| GET | `/diagnostic-reports/{id}/versions/{version}` | **报告指定版本正文 + 该版每条 result 绑定的观测 ID/版本/正文** |
 | GET | `/observations/{id}/_history` | 观测全部历史版本 |
 | GET | `/diagnostic-reports/{id}/_history` | 报告全部历史版本 |
 | GET | `/patients/{id}/_history` | 患者历史版本 |
+
+### 报告版本快照（测值可追溯）
+
+`GET /diagnostic-reports/{id}/versions/{version}` 返回该版报告正文，以及
+`result` 中每条观测在**这一版报告提交时实际采用的观测版本和正文**：
+
+```json
+{
+  "resourceType": "DiagnosticReport",
+  "id": "<报告id>",
+  "version": 2,
+  "etag": "W/\"2\"",
+  "resource": { "...": "该版报告正文" },
+  "result": [
+    {
+      "position": 0,
+      "observationId": "<观测id>",
+      "traceable": true,
+      "observationVersion": 1,
+      "etag": "W/\"1\"",
+      "resource": { "...": "该观测 v1 的完整正文（当时采用的测值）" }
+    },
+    {
+      "position": 1,
+      "observationId": "<观测id>",
+      "traceable": false,
+      "reason": "no-version-binding"
+    }
+  ]
+}
+```
+
+- `traceable: false` 表示该引用无法追溯到具体观测版本；`reason` 取值
+  `no-version-binding`（本系统显式记录的不可追溯）或
+  `legacy-version-without-bindings`（功能上线前的历史报告版本）。
+- 报告或观测版本不存在时返回 `404`（FHIR `OperationOutcome`）。
 
 ## 4. 业务规则与失败语义
 
@@ -131,15 +168,27 @@ Content-Type: application/json
    无法解析、引用不存在的外部资源 → `422`，整包拒绝。
 4. **患者一致性**：每份报告与其全部观测必须同属一个患者；把观测改挂其他
    患者时，若已有引用报告未在**同一 Bundle** 内一并更正 → `422`。
-5. **原子性**：任何校验/版本/引用失败都会回滚整个事务，不留任何资源或
-   修改；其他患者已提交的数据不受影响，后续合法 Bundle 仍可正常提交。
-6. **幂等**：
+5. **报告-观测版本绑定（测值可追溯）**：每个报告版本在同一事务内为每条
+   `result` 引用写一条版本绑定（`report_result_bindings`）：
+   - 新报告、新加的引用：绑定本包提交后该观测的当前版本；
+   - 更正报告时**保留的引用**：沿用上一版报告绑定的观测版本，即使观测后来
+     被单独更正也不动旧绑定；
+   - 仅当观测在**同一 Bundle** 内一并更正时，该引用才改绑到观测新版本；
+   - 旧版报告缺少绑定（功能上线前数据）或显式不可追溯的引用，逐条标记
+     `traceable=false`，后续更正沿用该状态，直到同包更正对应观测才重新可追溯。
+6. **原子性**：任何校验/版本/引用失败都会回滚整个事务，资源版本与报告绑定
+   一同撤销，不留任何资源或修改；其他患者已提交的数据不受影响，后续合法
+   Bundle 仍可正常提交。
+7. **并发更正**：报告与观测并发更正时，观测行被 `SELECT ... FOR UPDATE`
+   锁定，绑定严格反映提交先后；后到的 stale `If-Match` 请求以 `412` 拒绝，
+   不会出现指向不存在版本的绑定。
+8. **幂等**：
    - 同 `Idempotency-Key` + 同内容（规范化 JSON 哈希，与键序/空白无关）→
-     直接返回首次回执，不重复落库；
+     直接返回首次回执，不重复落库（版本与绑定都不重复写入）；
    - 同 key + 异内容 → `409`；
    - 失败的提交会释放幂等槽，修正后可用同一单号重试；
    - 幂等状态持久化在 PostgreSQL，进程重启/响应丢失后重试仍然安全。
-7. 所有错误均返回 FHIR `OperationOutcome`（`application/fhir+json`）。
+9. 所有错误均返回 FHIR `OperationOutcome`（`application/fhir+json`）。
 
 ## 5. 本地开发与自测（无需 Docker）
 
@@ -161,14 +210,17 @@ app/
   main.py            FastAPI 入口、异常处理
   config.py          环境配置
   database.py        引擎/会话/建表
-  models.py          ORM（患者/标识/观测/报告/关联/版本/幂等账本，PG JSONB）
+  models.py          ORM（患者/标识/观测/报告/关联/版本绑定/版本/幂等账本，PG JSONB）
   errors.py          OperationOutcome 错误体系
   fhir_utils.py      ETag/版本工具
-  routers/           /fhir 提交与资源读取路由
+  routers/           /fhir 提交与资源读取路由（含报告版本快照）
   services/
-    bundle.py        Bundle 校验、幂等、事务处理、患者一致性规则
-    queries.py       读取与历史查询
+    bundle.py        Bundle 校验、幂等、事务处理、患者一致性、报告-观测版本绑定
+    queries.py       读取、历史查询、报告版本快照（含绑定观测正文）
 scripts/entrypoint.sh  容器启动（等库+建表）
-tests/               25 个 pytest 用例（含并发、重启、原子性）
+tests/               pytest 用例（含并发、重启、原子性、版本绑定/可追溯）
 docker-compose.yml   db + api 两服务，含健康检查
 ```
+
+> 新增数据表 `report_result_bindings` 由启动时的 `create_all` 自动建立，
+> 已部署的库重启容器即可获得，无需手工迁移。

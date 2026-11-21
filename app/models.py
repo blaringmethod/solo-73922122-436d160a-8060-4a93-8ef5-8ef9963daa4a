@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     JSON,
     DateTime,
     ForeignKey,
@@ -126,6 +127,46 @@ class ReportLink(Base):
     )
 
     report: Mapped[DiagnosticReport] = relationship(back_populates="links")
+
+
+class ReportResultBinding(Base):
+    """Version-pinned binding of one DiagnosticReport version's result entry
+    to the exact Observation version that was in force when the report version
+    was committed.
+
+    A row is written for every result reference of every report version. When
+    a report version predates this binding feature (or the referenced
+    observation cannot be traced to a version), ``traceable`` is False and
+    ``observation_version`` is NULL; that untraceable state is deliberately
+    carried forward by subsequent corrections until the observation itself is
+    corrected in the same bundle.
+    """
+
+    __tablename__ = "report_result_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "report_id",
+            "report_version",
+            "position",
+            name="uq_report_version_binding_position",
+        ),
+        Index("ix_report_bindings_lookup", "report_id", "report_version"),
+        Index("ix_report_bindings_observation", "observation_id", "observation_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    report_id: Mapped[str] = mapped_column(
+        ForeignKey("diagnostic_reports.id", ondelete="CASCADE"), nullable=False
+    )
+    report_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    observation_id: Mapped[str] = mapped_column(
+        ForeignKey("observations.id", ondelete="RESTRICT"), nullable=False
+    )
+    # NULL when the binding is not traceable to an observation version.
+    observation_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    traceable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class ResourceVersion(Base):

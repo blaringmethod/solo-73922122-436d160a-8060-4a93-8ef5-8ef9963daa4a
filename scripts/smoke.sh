@@ -47,6 +47,37 @@ canon() { python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['re
 diff <(echo "$RECEIPT" | canon) <(echo "$REPLAY" | canon) && echo "   receipts identical (canonical comparison)"
 
 PID=$(echo "$RECEIPT" | python3 -c "import json,sys;print(next(m['id'] for m in json.load(sys.stdin)['resourceMap'] if m['resourceType']=='Patient'))")
+OID=$(echo "$RECEIPT" | python3 -c "import json,sys;print(next(m['id'] for m in json.load(sys.stdin)['resourceMap'] if m['resourceType']=='Observation'))")
+RID=$(echo "$RECEIPT" | python3 -c "import json,sys;print(next(m['id'] for m in json.load(sys.stdin)['resourceMap'] if m['resourceType']=='DiagnosticReport'))")
 echo "3) read patient $PID"
 curl -fsS "$BASE_URL/patients/$PID" | python3 -m json.tool | head -12
+
+echo "4) report v1 snapshot must pin the observation to version 1"
+SNAP1=$(curl -fsS "$BASE_URL/diagnostic-reports/$RID/versions/1")
+echo "$SNAP1" | python3 -m json.tool | head -30
+echo "$SNAP1" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['result'][0]['observationVersion']==1 and d['result'][0]['traceable'] is True"
+
+echo "5) correct the report narrative only (same result reference)"
+CORRECTED=$(cat <<JSON
+{
+  "resourceType": "Bundle",
+  "type": "transaction",
+  "entry": [
+    {"resource": {"resourceType": "DiagnosticReport", "id": "$RID", "status": "corrected",
+      "code": {"coding": [{"code": "24323-8"}]},
+      "subject": {"reference": "Patient/$PID"},
+      "result": [{"reference": "Observation/$OID"}]},
+     "request": {"method": "PUT", "url": "DiagnosticReport/$RID", "ifMatch": "W/\"1\""}}
+  ]
+}
+JSON
+)
+curl -fsS -X POST "$BASE_URL/fhir" -H "Idempotency-Key: $KEY-CORR" \
+  -H "Content-Type: application/json" -d "$CORRECTED" >/dev/null
+
+echo "6) report v2 keeps the v1 pin; report v1 still shows the original value"
+SNAP2=$(curl -fsS "$BASE_URL/diagnostic-reports/$RID/versions/2")
+echo "$SNAP2" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['version']==2 and d['result'][0]['observationVersion']==1"
+curl -fsS "$BASE_URL/diagnostic-reports/$RID/versions/1" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['resource']['status']=='final'"
 echo "SMOKE OK"

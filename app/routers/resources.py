@@ -112,6 +112,22 @@ def get_report(
     return {**view, "observationIds": obs_ids}
 
 
+@router.get("/diagnostic-reports/{report_id}/versions/{version}")
+def get_report_version(
+    report_id: str, version: int, session: Session = Depends(get_session)
+):
+    """Read a specific DiagnosticReport version and the observation values it used.
+
+    Returns the report body as committed at that version plus, for every
+    ``result`` entry, the bound Observation id, the exact observation version
+    pinned for this report version, and that observation version's body.
+    References that cannot be traced to an observation version are returned
+    with ``traceable: false`` and a machine-readable reason.
+    """
+    snapshot = queries.report_version_snapshot(session, report_id, version)
+    return snapshot
+
+
 # --- Version history ------------------------------------------------------- #
 
 @router.get("/observations/{observation_id}/_history")
